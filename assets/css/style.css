@@ -169,6 +169,7 @@ body {
     transition: background 0.2s ease;
 }
 
+
 #video {
     z-index: -1;
     position: absolute;
@@ -239,7 +240,7 @@ body {
 .number {
     position: absolute;
     z-index: -1;
-    display: none;
+    display: none; 
 }
 
 #toolbar-container {
