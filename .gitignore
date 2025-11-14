@@ -1,5 +1,4 @@
 .DS_Store
 lib/.DS_Store
-storage/json/*/
-php/models/*.zip
-php/models/*.glb
+storage/json/
+php/models/
