@@ -1,20 +1,77 @@
-/*
- * Client‑side 3D viewer and annotation tool for DLNarratives.
+/**
+ * load_model.js — Client-side 3D viewer and annotation tool
  *
- * This module drives the 3D scene (scene.html and customAnn.html) using
- * three.js.  It loads GLB or ZIP files uploaded by the user via the
- * server endpoints, interacts with the Sketchfab viewer API, and manages
- * custom annotations overlaid on the 3D model.  Functions in this
- * script handle theme toggling, loading/unloading models, extracting
- * assets from ZIP archives, saving narratives to the server
- * (`php/saveJson.php`), removing temporary GLB files (`php/removeGLB.php`),
- * and interacting with remote digital object pages (`php/getDigitalObjectPageForCorsP.php`).
+ * Overview
+ * ========
+ * This file is the primary client-side module used by the DLNarratives
+ * application to display and interact with 3D models. Responsibilities
+ * include:
+ *  - loading .glb files (and extracting .glb from .zip archives)
+ *  - initialising a Three.js scene with support for WebXR/AR
+ *  - managing annotation CRUD operations and synchronising them with
+ *    server-side JSON files
+ *  - integrating (optionally) with the Sketchfab viewer API
+ *  - exposing a small public API for page-level controls and actions
  *
- * The logic is complex and event‑driven.  Comments throughout the code
- * explain major sections such as file extraction, Sketchfab API
- * integration, annotation CRUD, and UI management.  Paths to server
- * endpoints are relative to `./php/` to maintain flexibility in
- * deployment.
+ * Public API (attached to window)
+ * -------------------------------
+ * The module exposes a handful of global functions used by HTML pages
+ * or other scripts. These are attached to `window` near the bottom of
+ * the file and should be treated as the stable interface:
+ *  - saveJSONAnnotations(refresh=false)
+ *  - deleteAnnotation()
+ *  - addDigitalObject(url, title, auto=false, validation=true)
+ *  - displayDigObjTooltip(el)
+ *  - confirmDeleteDigObj(url)
+ *  - changeCoors()
+ *  - refreshViewer()
+ *  - refreshTheme(theme)
+ *  - applyTheme(theme)
+ *  - closeTooltips(tooltip)
+ *
+ * Important globals and DOM expectations
+ * -------------------------------------
+ * The script expects the hosting pages (e.g. `scene.html`, `customAnn.html`)
+ * to include several DOM elements and ids. Important ones are:
+ *  - `#loader` — element shown/hidden by showLoader()/hideLoader()
+ *  - `#alert-placeholder` — container for temporary alerts
+ *  - `#annotationsPanel`, `#annotation-list`, `#annotation-list-div` — annotation UI
+ *  - `#modal-container` — Bootstrap modal used by showModal()
+ *  - `#label-renderer` — container used for CSS2D/CSS3D annotation elements
+ *  - `#scene-container` — used to change cursor state for coordinate picking
+ *
+ * External dependencies
+ * ---------------------
+ * This file relies on several libraries being available on the page:
+ *  - three.js core (THREE, GLTFLoader, CSS2DObject, CSS3DObject, Sprite, etc.)
+ *  - zip utilities (ZipReader, ZipWriter, BlobReader, BlobWriter) or a
+ *    compatible ZIP library
+ *  - Bootstrap (Modal, Tooltip)
+ *  - gsap (used to animate camera movements)
+ *  - (optional) Sketchfab viewer API for synchronising with Sketchfab annotations
+ *
+ * Server endpoints (expected)
+ * ---------------------------
+ * The module calls several PHP endpoints relative to the page root:
+ *  - `./php/checkSession.php` — validate user session before saving
+ *  - `./php/saveJson.php` — persist JSON annotation files
+ *  - `./php/saveZipModels.php` — save uploaded zip files
+ *  - `./php/saveGLBModels.php` — save glb files
+ *  - `./php/upload3DModel.php` — model upload endpoint used elsewhere
+ *  - `./php/removeGLB.php` — remove temporary GLB files
+ *
+ * Notes and maintenance
+ * ---------------------
+ *  - The file is large and covers multiple concerns. Consider splitting
+ *    it into smaller modules (loader, annotation-manager, ui, xr) for
+ *    improved testability and maintenance.
+ *  - Many functions assume DOM presence and session state; make sure
+ *    server-side session handling matches front-end flows.
+ *  - For performance, review behaviour when models or annotation counts
+ *    are very large (memory, number of DOM nodes, Canvas textures).
+ *
+ * See `docs/load_model.md` for a generated reference, usage examples and
+ * a function index.
  */
 
 import {BlobReader, BlobWriter, ZipReader, ZipWriter,} from "https://deno.land/x/zipjs/index.js";
@@ -68,22 +125,41 @@ let planesArray = [];
 const annotationsPanel = document.getElementById('annotationsPanel');
 let label2DRenderer;
 let label3DRenderer;
-
+/**
+ * Hide the global loader element.
+ * Safe no-op if the element is not present.
+ */
 function hideLoader() {
     document.getElementById('loader').style.display = 'none';
 }
 
+/**
+ * Show the global loader element.
+ * Displays a grid spinner by default; safe no-op if the element is missing.
+ */
 function showLoader() {
     document.getElementById('loader').style.display = 'grid';
 }
 
 // Functions to load the model correctly
 
+/**
+ * Fetch a local file and return a Blob.
+ * @param {string} filePath - Relative or absolute path to the resource.
+ * @returns {Promise<Blob>} Resolves to the fetched Blob.
+ * @throws Will throw if the network request fails.
+ */
 async function loadLocalFile(filePath) {
     const response = await fetch(filePath);
     return await response.blob();
 }
 
+/**
+ * POST a ZIP blob to the server to be saved in the user's model storage.
+ * Side effects: calls server endpoint `./php/saveZipModels.php` and logs server response.
+ * @param {Blob} zipBlob
+ * @param {string} modelName - Original model filename (with extension).
+ */
 async function saveZip(zipBlob, modelName) {
     const formData = new FormData();
 
@@ -111,6 +187,11 @@ async function saveZip(zipBlob, modelName) {
     }
 }
 
+/**
+ * Save a GLB Blob to the server.
+ * @param {Blob} glbBlob
+ * @param {string} filename - File name to use on the server (including extension)
+ */
 async function saveGLB(glbBlob, filename) {
     const formData = new FormData();
 
@@ -139,6 +220,12 @@ async function saveGLB(glbBlob, filename) {
     }
 }
 
+/**
+ * Extract entries from a zip Blob and save .glb files found inside.
+ * Uses `ZipReader` and `BlobWriter` from the included zip library.
+ * @param {Blob} zipBlob
+ * @param {string} modelName - The original zip filename (used to name saved GLB)
+ */
 async function extractZip(zipBlob, modelName) {
     const zipReader = await new ZipReader(await new BlobReader(zipBlob));
     const fileName = modelName.slice(0, -4) + '.glb';
@@ -162,6 +249,13 @@ async function extractZip(zipBlob, modelName) {
     }
 }
 
+/**
+ * Create a zip containing a local model and optionally trigger extraction on the server.
+ * Returns the model name on success.
+ * @param {string} chosenModel - Name of the model file (e.g. 'example.glb')
+ * @param {string} username
+ * @returns {Promise<string|undefined>}
+ */
 async function createZip(chosenModel, username) {
     try {
         // Write ZIP
@@ -204,6 +298,11 @@ async function createZip(chosenModel, username) {
     }
 }
 
+/**
+ * Wrapper used when the `model` parameter points to a .glb file — delegates to createZip.
+ * @param {string} chosenModel
+ * @param {string} username
+ */
 async function changeBody(chosenModel, username) {
     try {
 
@@ -228,7 +327,11 @@ async function changeBody(chosenModel, username) {
 
 // End part of functions to load the model correctly
 
-// get parameters from URL
+/**
+ * Retrieve a query parameter value from the current URL.
+ * @param {string} paramName - Name of the query parameter (without '?')
+ * @returns {string|null} - Returns the value or null if not present.
+ */
 function getParamValue (paramName) {
     let url = window.location.search.substring(1); // get rid of "?" in the querystring
 
@@ -357,6 +460,18 @@ else {
     let modelID;
     let laser;
 
+    /**
+     * Initialise Three.js scene, load the GLTF model and wire renderers/controls.
+     * This function prepares the camera, renderer, CSS2D/CSS3D renderers,
+     * loading of annotations and Sketchfab integration. It's the main entry
+     * point for starting the 3D viewer after the model file has been
+     * extracted/placed in `./php/models/<username>/`.
+     *
+     * Important side-effects:
+     *  - sets global `camera`, `renderer`, `model`, `modelScene`, `controls`, and others
+     *  - appends renderer DOM elements to the page
+     *  - registers resize and XR session event listeners
+     */
     async function initXR() {
 
         // Camera
@@ -1573,6 +1688,10 @@ else {
 
     }
 
+    /**
+     * Window resize handler.
+     * Resizes body, updates camera aspect and resizes the renderer canvas.
+     */
     function onWindowResize() {
         // resize body
         document.body.style.width = `${window.innerWidth}px`;
@@ -1587,7 +1706,11 @@ else {
 
     }
 
-    // this function is called constantly at runtime
+    /**
+     * Main animation loop called by renderer.setAnimationLoop.
+     * Handles XR controller dragging/rotation, applies smoothing and
+     * updates controls before calling `render()`.
+     */
     function animate() {
 
         if (isDragging) {
@@ -1688,6 +1811,11 @@ else {
 
     }
 
+    /**
+     * Render the current scene to the WebGL canvas and, when needed,
+     * render the CSS3D labels and update annotation screen positions.
+     * @private
+     */
     function render() {
 
         let xr = renderer.xr.isPresenting;
@@ -1744,7 +1872,12 @@ else {
 
     }
 
-    // screen position of the annotations
+    /**
+     * Update the screen position of HTML annotation elements so they follow
+     * their corresponding sprite in 3D space. Works for both non-XR and XR
+     * (DOM overlay) modes.
+     * @param {boolean} isXR - true when running in XR presentation mode
+     */
     function updateScreenPosition(isXR) {
 
         let thisCamera;
@@ -1811,7 +1944,10 @@ else {
         }
     }
 
-    // zoom level
+    /**
+     * Compute the current zoom level based on OrbitControls distance.
+     * Stores the value in the module-scoped `zoomLevel` variable.
+     */
     function getControlsZoom() {
         if (originalDistance == null) originalDistance = controls.getDistance();
 
@@ -1821,6 +1957,13 @@ else {
 
     }
 
+    /**
+     * Smoothly change camera position based on a mouse event.
+     * If the click intersects the model, the camera target is animated to
+     * the intersection point; otherwise the camera is reset to default.
+     * @param {MouseEvent} e
+     * @param {THREE.Raycaster} raycaster
+     */
     function changeCameraPosition(e, raycaster) {
         raycaster.setFromCamera(
             {
@@ -1868,6 +2011,11 @@ else {
         }
     }
 
+    /**
+     * Convert an array of annotation descriptors (from Sketchfab) into the
+     * internal json_data.events format and persist it via saveJson.
+     * @param {Array<Object>} annotations - List of {id,title,index,coordinates,cameraPosition}
+     */
     function saveNewSketchfabNarrative(annotations) {
 
         const events = json_data.events;
@@ -2217,7 +2365,12 @@ function applyTheme(theme) {
 
 }
 
-// add new annotation as event in the json file - function to memorize and save changes
+/**
+ * Gather form fields and persist the annotation(s) into `json_data` then
+ * save the file on the server. This function verifies the user session
+ * before attempting to write and shows a loader during the operation.
+ * @param {boolean} refresh - When true, triggers a cross-window refresh after save
+ */
 async function saveJSONAnnotations(refresh=false) {
 
     // show loading icon
@@ -2512,7 +2665,14 @@ async function saveJSONAnnotations(refresh=false) {
 
 }
 
-// save json file - check session
+/**
+ * Save the `json_data` for the given model. When `check_session` is true
+ * the function first verifies the server session before sending the
+ * payload to `./php/saveJson.php`.
+ * @param {string} modelName
+ * @param {Object} json_data
+ * @param {boolean} [check_session=true]
+ */
 function saveJson(modelName, json_data, check_session = true) {
 
     if (check_session) {
@@ -2567,7 +2727,12 @@ function saveJson(modelName, json_data, check_session = true) {
 
 }
 
-// save json file
+/**
+ * Internal helper to POST JSON to the server-side save endpoint.
+ * @param {string} modelName
+ * @param {Object} json_data
+ * @private
+ */
 function fetchJson(modelName, json_data) {
 
     const jsonToSave = JSON.stringify({
@@ -2725,6 +2890,10 @@ function reloadAnnotations(annotations, refresh=false) {
 
 }
 
+/**
+ * Append a button for an annotation to the annotations panel.
+ * Clicking the button will animate the camera to the annotation position.
+ */
 function appendButtonToPanel(index, spriteFront, renderer, title, ulAnn, cameraPosition) {
     const li = document.createElement('li');
     const liAnn = ulAnn.appendChild(li);
@@ -2744,6 +2913,13 @@ function appendButtonToPanel(index, spriteFront, renderer, title, ulAnn, cameraP
 }
 
 // this function handles annotation interactions
+/**
+ * Move the camera and show the annotation identified by index `i`.
+ * Handles showing/hiding annotation DOM elements and highlighting sprites.
+ * @param {number} i - zero-based annotation index
+ * @param {THREE.Vector3} point - world position to focus on
+ * @param {THREE.Vector3|undefined} cameraPosition - optional camera position to move to
+ */
 function goToAnnotation(i, point, cameraPosition) {
 
     // first of all, hide all annotations
@@ -2892,6 +3068,12 @@ function goToAnnotation(i, point, cameraPosition) {
 
 }
 
+/**
+ * Remove all programmatically-created annotation sprites and DOM labels
+ * from the scene and reset related state variables.
+ * @param {Array<THREE.Group>} annotationMeshList
+ * @param {boolean} annotationIsDisplayed
+ */
 function removeAnnotations(annotationMeshList, annotationIsDisplayed) {
     scene.children = scene.children.filter(child => {
         if (child.isCSS2DObject) {
@@ -3023,6 +3205,13 @@ function download(text, filename) {
     }
 }
 
+/**
+ * Display a transient Bootstrap-style alert in the `#alert-placeholder`.
+ * @param {string} id - element id to assign to the alert
+ * @param {string} message - text/html to show inside the alert
+ * @param {string} level - Bootstrap alert level (e.g. 'success', 'danger')
+ * @param {number} [time=1000] - milliseconds to keep the alert visible; <=0 keeps it persistent
+ */
 function showAlert(id, message, level, time = 1000) {
 
     let alertDiv = document.createElement("div");
@@ -3087,6 +3276,15 @@ function computeAnnotationScale(referenceSprite) {
 }
 
 // element in the 3D and AR scenes - it represents the circle and the number of each annotation, together with canvas
+/**
+ * Create front and rear sprites for an annotation using a canvas texture.
+ * The front sprite is fully opaque while the rear uses lower opacity so
+ * both sides are visible in some XR setups.
+ * @param {HTMLCanvasElement} canvas - Canvas element containing the number texture
+ * @param {THREE.Vector3} point - World-space position for the sprite
+ * @param {number} number - Index number used to set the sprite name
+ * @returns {THREE.Sprite} The front sprite created and added to `model`
+ */
 function createSprite(canvas, point, number) {
 
     const annotationVector = new THREE.Vector3(point.x, point.y, point.z);
@@ -3136,6 +3334,16 @@ function sortEntries(entries, positionsOriginal, positionsNormalized) {
 }
 
 function createAnnotationDOM(title, description, index, position, annotationListDiv) {
+/**
+ * Build and insert the HTML structure used as an annotation label.
+ * Creates a hidden annotation DOM element, clones it for the
+ * annotation list, and creates CSS2D/CSS3D objects attached to `model`.
+ * @param {string} title
+ * @param {string} description - HTML description string
+ * @param {number} index - 1-based annotation index
+ * @param {THREE.Vector3} position - World-space position where the label will be placed
+ * @param {HTMLElement} annotationListDiv - container used for HoloLens fallback
+ */
     let annotationDiv = document.createElement('div');
     let annotationTitle = document.createElement('div');
     let annotationH = document.createElement('h1');
@@ -3185,6 +3393,11 @@ function createAnnotationDOM(title, description, index, position, annotationList
 }
 
 function getFormFields() {
+/**
+ * Convenience helper that returns commonly used form input elements as an array.
+ * Order: [title, description, coordinates, position, digobjurl, digobjtitle, digobjtable, entities, entitiesDiv, oldPosition, eventID, cameraPos]
+ * @returns {Array<HTMLElement>}
+ */
     const title = document.getElementById('title');
     const description = document.getElementById('description');
     const coordinates = document.getElementById('coordinates');
@@ -3201,6 +3414,26 @@ function getFormFields() {
 }
 
 function fillForm(title, description, coordinates, position, digobjurl, digobjtitle, digobjtable, entities, entitiesDiv, point, positionInList, oldPositionInList, eventID, annotationID, initializeAnnotation, cameraPos) {
+/**
+ * Populate the annotation edit form with values from the given annotation
+ * or initialize fields for a new annotation.
+ * @param {HTMLElement} title - input element for title
+ * @param {HTMLElement} description - textarea element for description
+ * @param {HTMLElement} coordinates - input element for coordinates
+ * @param {HTMLElement} position - input/select element for ordering
+ * @param {HTMLElement} digobjurl - input element for digital object url
+ * @param {HTMLElement} digobjtitle - input element for digital object title
+ * @param {HTMLElement} digobjtable - container for digital objects
+ * @param {HTMLElement} entities - entity input
+ * @param {HTMLElement} entitiesDiv - container for selected entities
+ * @param {THREE.Vector3} point - annotation coordinates
+ * @param {number} positionInList - numeric ordering index
+ * @param {HTMLElement} oldPositionInList - element showing previous position
+ * @param {HTMLElement} eventID - hidden input with event id
+ * @param {string} annotationID - id of existing annotation (when editing)
+ * @param {boolean} initializeAnnotation - true when creating a new annotation
+ * @param {HTMLElement} cameraPos - element showing stored camera position
+ */
 
     // empty digital object table
     digobjtable.textContent = '';
@@ -3269,6 +3502,14 @@ function fillForm(title, description, coordinates, position, digobjurl, digobjti
 }
 
 // add annotation to list in customAnn.html
+/**
+ * Insert an entry for an annotation into the custom annotations sidebar.
+ * Adds edit/delete buttons and wires their handlers.
+ * @param {string} text - annotation title
+ * @param {number} i - annotation index
+ * @param {THREE.Vector3} point - annotation coordinates
+ * @param {string} event_ID - internal event identifier
+ */
 function addAnnotationToList(text, i, point, event_ID) {
     const annotationsContainer = document.getElementById('annotations-container');
 
@@ -3407,6 +3648,13 @@ function addAnnotationToList(text, i, point, event_ID) {
 }
 
 // element in the 3D and AR scenes - it represents the circle and the number of each annotation, together with sprites
+/**
+ * Create a circular canvas with a number inside. The canvas is appended to
+ * the document body and returned for use as a texture for sprites.
+ * @param {number} number - zero-based annotation index
+ * @param {string} [color='white'] - stroke and number color
+ * @returns {HTMLCanvasElement}
+ */
 function createCanvas(number, color = 'white') {
 
     let canvas = document.createElement('canvas');
@@ -3454,6 +3702,14 @@ function changeCanvasColor(element, color) {
 
 }
 
+/**
+ * Simple word-wrapping helper used by AR canvas rendering.
+ * Returns an array of lines that fit within `maxWidth` measured via ctx.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} text
+ * @param {number} maxWidth
+ * @returns {string[]}
+ */
 function wrapText(ctx, text, maxWidth) {
     const words = text.split(' ');
     const lines = [];
@@ -3474,6 +3730,14 @@ function wrapText(ctx, text, maxWidth) {
 }
 
 // create annotation on HoloLens - when the user interacts with numbers
+/**
+ * Create a textured plane (front + back) to render annotation HTML on XR/HoloLens.
+ * The function measures text, draws it on a canvas, creates materials and
+ * returns a THREE.Group containing the two planes.
+ * @param {HTMLElement} htmlElement - annotation DOM element to render
+ * @param {string} name - name/id assigned to the created group
+ * @returns {THREE.Group}
+ */
 function createAnnotationPlane(htmlElement, name) {
     canvasXR = document.createElement('canvas');
     const context = canvasXR.getContext('2d');
@@ -3655,6 +3919,10 @@ function createAnnotationPlane(htmlElement, name) {
     return group;
 }
 
+/**
+ * Delete the currently selected annotation from `json_data`, remove related
+ * sprites and DOM entries, persist the change and refresh the UI.
+ */
 function deleteAnnotation() {
     try {
 
@@ -3726,6 +3994,13 @@ function deleteAnnotation() {
     }
 }
 
+/**
+ * Recursively collect sprite objects from a Three.js object tree.
+ * If `onlyFront` is true only sprites tagged as front are returned.
+ * @param {THREE.Object3D} object
+ * @param {boolean} [onlyFront=false]
+ * @returns {Array<THREE.Sprite>}
+ */
 function getAllSprites(object, onlyFront=false) {
     let sprites = [];
 
@@ -3754,6 +4029,14 @@ function getRandomEventID() {
     return getRandom13DigitNumber().toString();
 }
 
+/**
+ * Add a digital object preview to the form. Validates and prepares the
+ * UI entries and calls `createDigObjPreview` to render the preview.
+ * @param {string} inputValue - URL
+ * @param {string} inputValue2 - title
+ * @param {boolean} auto - whether the call is automatic (no UI focus)
+ * @param {boolean} validation - whether to validate inputs
+ */
 function addDigitalObject(inputValue, inputValue2, auto, validation) {
     try {
 
@@ -3793,6 +4076,12 @@ function addDigitalObject(inputValue, inputValue2, auto, validation) {
 }
 
 // the element and its style in DOM
+/**
+ * Render a preview link for a digital object inside `#digobj-table` if
+ * it isn't already present.
+ * @param {string} urlObj
+ * @param {string} title
+ */
 function createDigObjPreview(urlObj, title) {
     let regex = /<title>(.*?)</;
 
@@ -4030,6 +4319,18 @@ function addEntity(props, text, type, id, entityLoaderDiv) {
     selectedItemsContainer.appendChild(selectedItem);
 }
 
+/**
+ * Show a Bootstrap modal with the given title and HTML content. Optionally
+ * attaches cancel/confirm button listeners.
+ * @param {boolean} forceShow - when true the modal cannot be dismissed by the user
+ * @param {string} title
+ * @param {string} text - HTML content for modal body
+ * @param {string|undefined} btnCancel - cancel button label
+ * @param {string|undefined} btnOK - confirm button label
+ * @param {Function|undefined} callbackCancel - cancel callback
+ * @param {Function|undefined} callbackOK - confirm callback
+ * @param {string} [classButton='btn-primary'] - CSS class for confirm button
+ */
 function showModal(forceShow, title, text, btnCancel, btnOK, callbackCancel, callbackOK, classButton='btn-primary') {
 
     // fill HTML modal information
@@ -4092,6 +4393,9 @@ function showModal(forceShow, title, text, btnCancel, btnOK, callbackCancel, cal
 
 }
 
+/**
+ * Remove previously attached modal listeners to avoid duplicate handlers.
+ */
 function removeModalListener() {
     const modal = document.getElementById('modal-container');
     const modalCancel = modal.querySelector('#modal-dismiss');

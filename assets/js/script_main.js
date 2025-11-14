@@ -1,17 +1,62 @@
-/*
- * Main user interface logic for the DLNarratives dashboard.
+/**
+ * script_main.js
  *
- * This script powers the landing page (index.html) of the application.  It
- * handles user authentication (calling the `php/login.php` endpoint),
- * session checks (`php/checkSession.php`), uploading 3D models (.glb
- * and .zip) to the server, listing available models (`php/scanGLB.php`),
- * renaming (`php/renameModel.php`) and deleting (`php/deleteModel.php`) models,
- * and orchestrating simple UI interactions such as alerts and modal dialogs.
- * All network requests use relative paths to the `php` directory to remain
- * independent of deployment location.  Changes to the server folder
- * structure should therefore be mirrored here.
+ * Main user-interface logic for the DLNarratives dashboard (index.html).
+ *
+ * Responsibilities
+ * - Manage the landing/dashboard UI: show/hide forms, alerts, modals and lists
+ * - Handle authentication (calls to `php/login.php`, `php/checkSession.php`)
+ * - Upload models (.glb / .zip) via `php/upload3DModel.php`
+ * - List, rename, download and delete models using `php/scanGLB.php`,
+ *   `php/renameModel.php`, `php/deleteModel.php`
+ * - Orchestrate iframe-based viewer launch (scene.html) and related UI
+ *
+ * Public functions (attached to global window via DOM interactions)
+ * - showAlert(id, message, level, time)
+ * - showModal(forceShow, title, text, btnCancel, btnOK, callbackCancel, callbackOK, classButton)
+ *
+ * DOM elements expected by this script
+ * - #alert-placeholder         : container for transient alerts
+ * - #modal-container          : bootstrap modal element with #modal-title,
+ *                               .modal-body, #modal-dismiss and #modal-confirm
+ * - #loader                   : loader overlay element (shown/hidden)
+ * - #model-list               : container where models are listed
+ * - #model-list-container     : outer container used for vertical scroll
+ * - #form-model, #model-div, #main-form-container, footer : layout elements toggled
+ * - #login-button, #logout-btn, #model-input, #username, #password : inputs and buttons
+ *
+ * Server endpoints used (relative)
+ * - ./php/login.php
+ * - ./php/checkSession.php
+ * - ./php/upload3DModel.php
+ * - ./php/scanGLB.php
+ * - ./php/renameModel.php
+ * - ./php/deleteModel.php
+ *
+ * Notes for maintainers
+ * - Keep DOM selectors in sync with the HTML templates (index.html)
+ * - This file is intentionally small and UI-focused; business logic is
+ *   implemented server-side in php/. Consider moving some network code
+ *   to a small API wrapper module if this grows.
  */
 
+/**
+ * showAlert
+ * Create and display a transient Bootstrap-style alert inside
+ * `#alert-placeholder`.
+ *
+ * Parameters:
+ * - id (string)     : a short identifier used as a CSS class to allow
+ *                     targeted removal/testing of the alert
+ * - message (string): HTML/text shown inside the alert
+ * - level (string)  : Bootstrap alert level (success, danger, warning, info)
+ * - time (number)   : milliseconds until the alert fades out (default 1000)
+ *
+ * Notes:
+ * - This function clears the placeholder before inserting the alert so only
+ *   one alert is visible at a time. The alert is removed from the DOM after
+ *   it fades out.
+ */
 function showAlert(id, message, level, time = 1000) {
 
 	let alertDiv = document.createElement("div");
@@ -38,6 +83,22 @@ function showAlert(id, message, level, time = 1000) {
 	}, time);
 }
 
+/**
+ * showModal
+ * Show a Bootstrap modal located at `#modal-container` and wire its
+ * Cancel/Confirm buttons. This helper centralizes modal behaviour so callers
+ * can display messages and hook callbacks without manipulating the DOM.
+ *
+ * Parameters:
+ * - forceShow (boolean): if true, the modal cannot be closed by backdrop or ESC
+ * - title (string)     : modal title text
+ * - text (string)      : HTML content inserted into the modal body
+ * - btnCancel (string) : Cancel button text (or falsy to hide)
+ * - btnOK (string)     : OK button text (or falsy to hide)
+ * - callbackCancel     : function called when Cancel clicked
+ * - callbackOK         : function called when OK clicked
+ * - classButton        : CSS class for the confirm button (default 'btn-primary')
+ */
 function showModal(forceShow, title, text, btnCancel, btnOK, callbackCancel, callbackOK, classButton='btn-primary') {
 
 	// fill HTML modal information
@@ -100,14 +161,30 @@ function showModal(forceShow, title, text, btnCancel, btnOK, callbackCancel, cal
 
 }
 
+/**
+ * hideLoader
+ * Hide the global loader overlay (`#loader`). Uses defensive DOM access.
+ */
 function hideLoader() {
 	document.getElementById('loader').style.display = 'none';
 }
 
+/**
+ * showLoader
+ * Show the global loader overlay (`#loader`). Uses defensive DOM access.
+ */
 function showLoader() {
 	document.getElementById('loader').style.display = 'grid';
 }
 
+/**
+ * addScrolls
+ * Adjusts overflow behavior for the model list and per-item containers.
+ * - Enables vertical scroll on `#model-list-container` when the model list is
+ *   taller than its container.
+ * - Enables horizontal scroll for `.model-item` elements when their content
+ *   overflows the available width.
+ */
 function addScrolls() {
 
 	const modelList = document.getElementById('model-list');
@@ -228,6 +305,16 @@ function uploadModel(thisModel, username) {
 	});
 }
 
+/**
+ * addAnnotationToList
+ * Create a single list item for `modelName` and attach View / Rename /
+ * Download / Delete controls. Each control wires server requests and
+ * UI transitions (iframe viewer, modal dialogs).
+ *
+ * Parameters:
+ * - modelName (string): filename including extension (e.g. "scene.glb")
+ * - username (string) : owner username used for server actions
+ */
 function addAnnotationToList(modelName, username) {
 	const annotationsContainer = document.getElementById('model-list');
 
@@ -481,6 +568,13 @@ function addAnnotationToList(modelName, username) {
 	buttonsDiv.appendChild(deleteButton);
 }
 
+/**
+ * checkModels
+ * Fetch the list of models for `username` from the server and populate the
+ * model list UI by calling `addAnnotationToList` for each file.
+ *
+ * Uses `./php/scanGLB.php` (POST with {username}). On error displays an alert.
+ */
 async function checkModels (username) {
 
 	const usernameJson = {
@@ -515,6 +609,14 @@ async function checkModels (username) {
 		});
 }
 
+/**
+ * displayMainForm
+ * Transition the UI from login view to the dashboard. Shows the main
+ * container, sets welcome text and wires the upload input.
+ *
+ * Parameters:
+ * - data (object) : expected to contain `username` returned by the server
+ */
 async function displayMainForm(data) {
 
 	// remove the login form and add the main form
@@ -532,6 +634,12 @@ async function displayMainForm(data) {
 
 }
 
+/**
+ * checkSession_and_displayMainForm
+ * Wrapper that queries `./php/checkSession.php` and, if the session is
+ * valid, calls `displayMainForm`. If `refresh` is true it clears the
+ * displayed model list before re-fetching.
+ */
 function checkSession_and_displayMainForm(refresh = false) {
 
 	if (refresh) document.getElementById('model-list').innerHTML = '';
@@ -546,6 +654,11 @@ function checkSession_and_displayMainForm(refresh = false) {
 
 }
 
+/**
+ * Window onload handler
+ * - checks session and displays the main form when possible
+ * - wires login and logout button handlers
+ */
 window.onload = async function () {
 
 	await checkSession_and_displayMainForm();
